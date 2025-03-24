@@ -1,0 +1,1446 @@
+--
+-- PostgreSQL database dump
+--
+
+-- Dumped from database version 15.2
+-- Dumped by pg_dump version 15.2
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: tipologia_corso; Type: DOMAIN; Schema: public; Owner: postgres
+--
+
+CREATE DOMAIN public.tipologia_corso AS character varying(10)
+	CONSTRAINT tipologia_corso_check CHECK (((VALUE)::text = ANY ((ARRAY['triennale'::character varying, 'magistrale'::character varying])::text[])));
+
+
+ALTER DOMAIN public.tipologia_corso OWNER TO postgres;
+
+--
+-- Name: usertype; Type: DOMAIN; Schema: public; Owner: postgres
+--
+
+CREATE DOMAIN public.usertype AS character varying(10)
+	CONSTRAINT usertype_check CHECK (((VALUE)::text = ANY ((ARRAY['segreteria'::character varying, 'docente'::character varying, 'studente'::character varying])::text[])));
+
+
+ALTER DOMAIN public.usertype OWNER TO postgres;
+
+--
+-- Name: controlla_data(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.controlla_data() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF new.data < current_date THEN
+        RAISE EXCEPTION 'Impossibile inserire un esame con data precedente alla data odierna';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.controlla_data() OWNER TO postgres;
+
+--
+-- Name: controlla_duplicati_studente(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.controlla_duplicati_studente() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM storico_studente WHERE matricola = NEW.matricola
+    ) THEN
+        RAISE EXCEPTION 'Impossibile inserire: matricola gia'' presente in storico_studente.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.controlla_duplicati_studente() OWNER TO postgres;
+
+--
+-- Name: controlla_validita_anno(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.controlla_validita_anno() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    tipologia_corso tipologia_corso;
+BEGIN
+    SELECT tipologia INTO tipologia_corso
+    FROM corso_di_laurea
+    WHERE id = NEW.corso_di_laurea;
+    
+    IF tipologia_corso = 'triennale' AND (NEW.anno < 1 OR NEW.anno > 3) THEN
+        RAISE EXCEPTION 'L''attributo anno deve essere compreso tra 1 e 3 per i corsi triennali';
+    END IF;
+    
+    IF tipologia_corso = 'magistrale' AND (NEW.anno < 1 OR NEW.anno > 2) THEN
+        RAISE EXCEPTION 'L''attributo anno deve essere compreso tra 1 e 2 per i corsi magistrali';
+    END IF;
+    
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.controlla_validita_anno() OWNER TO postgres;
+
+--
+-- Name: controlla_validita_iscrizione(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.controlla_validita_iscrizione() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+cdl_studente INTEGER;
+numero_propedeuticita INTEGER;
+numero_esami_promossi INTEGER;
+BEGIN
+    -- Ottieni il corso di laurea dello studente
+    
+    SELECT corso_di_laurea INTO cdl_studente
+    FROM studente
+    WHERE matricola = NEW.studente;
+    
+    -- controllo che lo studente sia iscritto al corso di laurea dell'esame a cui si vuole iscrivere
+    IF cdl_studente <> NEW.corso_di_laurea THEN
+        RAISE EXCEPTION 'Lo studente non appartiene allo stesso corso di laurea dell''esame.';
+    END IF;
+
+    -- conto il numero di esami propedeutici all'esame che ci si vuole iscrivere
+    SELECT count(*) INTO numero_propedeuticita
+    FROM propedeuticita
+    WHERE propedeutico_a = NEW.insegnamento;
+
+    -- conto il numero di esami promossi per lo studente che si vuole iscrivere tra quelli propedeutici all'esame a cui si vuole iscrivere
+    -- controllo questo tramite un join tra carriera_valida (per non avere voti duplicati) e propedeuticita'
+    SELECT count(*) INTO numero_esami_promossi
+    FROM propedeuticita p JOIN carriera_valida c ON p.corso_di_laurea1 = c.corso_di_laurea AND p.insegnamento = c.insegnamento
+    WHERE c.studente = NEW.studente AND p.corso_di_laurea1 = NEW.corso_di_laurea AND p.propedeutico_a = NEW.insegnamento AND c.esito = 'promosso';
+    
+    -- se i 2 numeri non coincidono sollevo un eccezione
+    IF numero_propedeuticita <> numero_esami_promossi THEN
+        RAISE EXCEPTION 'Studente non idoneo a iscriversi, non ha superato tutti gli esami propedeutici.';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.controlla_validita_iscrizione() OWNER TO postgres;
+
+--
+-- Name: controllo_coerenza_propedeuticita(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.controllo_coerenza_propedeuticita() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF (SELECT anno FROM insegnamento WHERE codice_univoco = NEW.insegnamento) >= (SELECT anno FROM insegnamento WHERE codice_univoco = NEW.propedeutico_a) THEN
+        RAISE EXCEPTION 'l''insegnamento propedeutico non puo'' essere di un anno maggiore';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.controllo_coerenza_propedeuticita() OWNER TO postgres;
+
+--
+-- Name: controllo_numero_responsabile_insegnamenti(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.controllo_numero_responsabile_insegnamenti() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    total_insegnamenti integer;
+BEGIN
+    SELECT COUNT(*) INTO total_insegnamenti
+    FROM insegnamento
+    WHERE responsabile = NEW.responsabile;
+
+    IF total_insegnamenti >= 3  AND NEW.responsabile <> OLD.responsabile THEN
+        RAISE EXCEPTION 'Un docente non puo'' essere responsabile di piu'' di 3 insegnamenti.';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.controllo_numero_responsabile_insegnamenti() OWNER TO postgres;
+
+--
+-- Name: controllo_responsabilita_corso_di_laurea(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.controllo_responsabilita_corso_di_laurea() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM corso_di_laurea
+        WHERE responsabile = NEW.responsabile
+        AND id <> NEW.id
+    ) THEN
+        RAISE EXCEPTION 'Un docente puo'' essere responsabile di al massimo un corso di laurea.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.controllo_responsabilita_corso_di_laurea() OWNER TO postgres;
+
+--
+-- Name: cripta_password(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.cripta_password() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    NEW.password := MD5(NEW.password);
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.cripta_password() OWNER TO postgres;
+
+--
+-- Name: inserimento_storico_carriera(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.inserimento_storico_carriera() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    INSERT INTO storico_carriera (data, insegnamento, corso_di_laurea, studente, voto, esito)
+    VALUES (OLD.data, OLD.insegnamento, OLD.corso_di_laurea, OLD.studente, OLD.voto, OLD.esito);
+    RETURN OLD;
+END;
+$$;
+
+
+ALTER FUNCTION public.inserimento_storico_carriera() OWNER TO postgres;
+
+--
+-- Name: inserimento_storico_studente(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.inserimento_storico_studente() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    -- Inserisci il nuovo record nella tabella storico
+    INSERT INTO storico_studente (matricola, corso_di_laurea, nome, cognome, e_mail)
+    VALUES (old.matricola, old.corso_di_laurea, old.nome, old.cognome, old.e_mail);
+    RETURN OLD;
+END;
+$$;
+
+
+ALTER FUNCTION public.inserimento_storico_studente() OWNER TO postgres;
+
+--
+-- Name: verifica_data_esami_univoca(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.verifica_data_esami_univoca() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM esame
+        WHERE corso_di_laurea = NEW.corso_di_laurea
+          AND data = NEW.data
+    ) THEN
+        RAISE NOTICE 'Non e'' possibile inserire un record con la stessa data e corso di laurea.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.verifica_data_esami_univoca() OWNER TO postgres;
+
+--
+-- Name: verifica_iscrizione_esami(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.verifica_iscrizione_esami() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    -- Controlla se esiste un record in iscrizione_esami corrispondente
+    IF EXISTS (
+        SELECT 1
+        FROM iscrizione_esami
+        WHERE data = NEW.data
+            AND insegnamento = NEW.insegnamento
+            AND corso_di_laurea = NEW.corso_di_laurea
+            AND studente = NEW.studente
+    ) THEN
+       
+        -- Elimina il record corrispondente da iscrizione_esami
+        DELETE FROM iscrizione_esami
+        WHERE data = NEW.data
+            AND insegnamento = NEW.insegnamento
+            AND corso_di_laurea = NEW.corso_di_laurea
+            AND studente = NEW.studente;
+    ELSE
+        -- Se non c'Š un record corrispondente in iscrizione_esami, lancia un'eccezione
+        RAISE exception 'Nessuna iscrizione trovata per l''esame';
+        -- return null; se utilizzo raise notice devo usare questo comando
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.verifica_iscrizione_esami() OWNER TO postgres;
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: carriera; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.carriera (
+    data date NOT NULL,
+    insegnamento integer NOT NULL,
+    corso_di_laurea integer NOT NULL,
+    studente integer NOT NULL,
+    voto smallint NOT NULL,
+    esito character varying(8) GENERATED ALWAYS AS (
+CASE
+    WHEN (voto >= 18) THEN 'promosso'::text
+    ELSE 'bocciato'::text
+END) STORED,
+    CONSTRAINT carriera_voto_check CHECK (((voto >= 0) AND (voto <= 30)))
+);
+
+
+ALTER TABLE public.carriera OWNER TO postgres;
+
+--
+-- Name: carriera_valida; Type: VIEW; Schema: public; Owner: postgres
+--
+
+CREATE VIEW public.carriera_valida AS
+ SELECT c.studente,
+    c.insegnamento,
+    c.corso_di_laurea,
+    c.data,
+    c.voto,
+    c.esito
+   FROM public.carriera c
+  WHERE (((c.esito)::text = 'promosso'::text) AND (c.data = ( SELECT max(c1.data) AS max
+           FROM public.carriera c1
+          WHERE ((c1.insegnamento = c.insegnamento) AND (c1.corso_di_laurea = c.corso_di_laurea) AND (c1.studente = c.studente)))));
+
+
+ALTER TABLE public.carriera_valida OWNER TO postgres;
+
+--
+-- Name: storico_carriera; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.storico_carriera (
+    data date NOT NULL,
+    insegnamento integer NOT NULL,
+    corso_di_laurea integer NOT NULL,
+    studente integer NOT NULL,
+    voto smallint NOT NULL,
+    esito character varying(8),
+    CONSTRAINT storico_carriera_voto_check CHECK (((voto >= 0) AND (voto <= 30)))
+);
+
+
+ALTER TABLE public.storico_carriera OWNER TO postgres;
+
+--
+-- Name: carriera_valida_studenti_rimossi; Type: VIEW; Schema: public; Owner: postgres
+--
+
+CREATE VIEW public.carriera_valida_studenti_rimossi AS
+ SELECT c.studente,
+    c.insegnamento,
+    c.corso_di_laurea,
+    c.data,
+    c.voto,
+    c.esito
+   FROM public.storico_carriera c
+  WHERE (((c.esito)::text = 'promosso'::text) AND (c.data = ( SELECT max(c1.data) AS max
+           FROM public.storico_carriera c1
+          WHERE ((c1.insegnamento = c.insegnamento) AND (c1.corso_di_laurea = c.corso_di_laurea) AND (c1.studente = c.studente)))));
+
+
+ALTER TABLE public.carriera_valida_studenti_rimossi OWNER TO postgres;
+
+--
+-- Name: corso_di_laurea; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.corso_di_laurea (
+    id integer NOT NULL,
+    responsabile integer NOT NULL,
+    tipologia public.tipologia_corso NOT NULL,
+    nome character varying(30) NOT NULL
+);
+
+
+ALTER TABLE public.corso_di_laurea OWNER TO postgres;
+
+--
+-- Name: corso_di_laurea_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.corso_di_laurea_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.corso_di_laurea_id_seq OWNER TO postgres;
+
+--
+-- Name: corso_di_laurea_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.corso_di_laurea_id_seq OWNED BY public.corso_di_laurea.id;
+
+
+--
+-- Name: docente; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.docente (
+    id integer NOT NULL,
+    utente character varying(20) NOT NULL,
+    nome character varying(20),
+    cognome character varying(20),
+    e_mail character varying(30)
+);
+
+
+ALTER TABLE public.docente OWNER TO postgres;
+
+--
+-- Name: docente_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.docente_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.docente_id_seq OWNER TO postgres;
+
+--
+-- Name: docente_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.docente_id_seq OWNED BY public.docente.id;
+
+
+--
+-- Name: esame; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.esame (
+    corso_di_laurea integer NOT NULL,
+    insegnamento integer NOT NULL,
+    data date NOT NULL
+);
+
+
+ALTER TABLE public.esame OWNER TO postgres;
+
+--
+-- Name: insegnamento; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.insegnamento (
+    codice_univoco integer NOT NULL,
+    corso_di_laurea integer NOT NULL,
+    responsabile integer NOT NULL,
+    nome character varying(40) NOT NULL,
+    descrizione text,
+    anno smallint NOT NULL,
+    CONSTRAINT insegnamento_anno_check CHECK (((anno > 0) AND (anno < 4)))
+);
+
+
+ALTER TABLE public.insegnamento OWNER TO postgres;
+
+--
+-- Name: insegnamento_codice_univoco_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.insegnamento_codice_univoco_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.insegnamento_codice_univoco_seq OWNER TO postgres;
+
+--
+-- Name: insegnamento_codice_univoco_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.insegnamento_codice_univoco_seq OWNED BY public.insegnamento.codice_univoco;
+
+
+--
+-- Name: iscrizione_esami; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.iscrizione_esami (
+    data date NOT NULL,
+    insegnamento integer NOT NULL,
+    corso_di_laurea integer NOT NULL,
+    studente integer NOT NULL
+);
+
+
+ALTER TABLE public.iscrizione_esami OWNER TO postgres;
+
+--
+-- Name: propedeuticita; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.propedeuticita (
+    corso_di_laurea1 integer NOT NULL,
+    insegnamento integer NOT NULL,
+    corso_di_laurea2 integer NOT NULL,
+    propedeutico_a integer NOT NULL,
+    CONSTRAINT propedeuticita_check CHECK ((corso_di_laurea1 = corso_di_laurea2)),
+    CONSTRAINT propedeuticita_check1 CHECK ((insegnamento <> propedeutico_a))
+);
+
+
+ALTER TABLE public.propedeuticita OWNER TO postgres;
+
+--
+-- Name: segreteria; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.segreteria (
+    id integer NOT NULL,
+    utente character varying(20) NOT NULL,
+    nome character varying(20),
+    cognome character varying(20)
+);
+
+
+ALTER TABLE public.segreteria OWNER TO postgres;
+
+--
+-- Name: segreteria_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.segreteria_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.segreteria_id_seq OWNER TO postgres;
+
+--
+-- Name: segreteria_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.segreteria_id_seq OWNED BY public.segreteria.id;
+
+
+--
+-- Name: storico_studente; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.storico_studente (
+    matricola integer NOT NULL,
+    corso_di_laurea integer NOT NULL,
+    nome character varying(20),
+    cognome character varying(20),
+    e_mail character varying(30)
+);
+
+
+ALTER TABLE public.storico_studente OWNER TO postgres;
+
+--
+-- Name: studente; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.studente (
+    matricola integer NOT NULL,
+    corso_di_laurea integer NOT NULL,
+    utente character varying(20) NOT NULL,
+    nome character varying(20),
+    cognome character varying(20),
+    e_mail character varying(30)
+);
+
+
+ALTER TABLE public.studente OWNER TO postgres;
+
+--
+-- Name: studente_matricola_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+CREATE SEQUENCE public.studente_matricola_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE public.studente_matricola_seq OWNER TO postgres;
+
+--
+-- Name: studente_matricola_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: postgres
+--
+
+ALTER SEQUENCE public.studente_matricola_seq OWNED BY public.studente.matricola;
+
+
+--
+-- Name: utente; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.utente (
+    username character varying(20) NOT NULL,
+    password text NOT NULL,
+    tipo_utente public.usertype NOT NULL
+);
+
+
+ALTER TABLE public.utente OWNER TO postgres;
+
+--
+-- Name: corso_di_laurea id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.corso_di_laurea ALTER COLUMN id SET DEFAULT nextval('public.corso_di_laurea_id_seq'::regclass);
+
+
+--
+-- Name: docente id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.docente ALTER COLUMN id SET DEFAULT nextval('public.docente_id_seq'::regclass);
+
+
+--
+-- Name: insegnamento codice_univoco; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.insegnamento ALTER COLUMN codice_univoco SET DEFAULT nextval('public.insegnamento_codice_univoco_seq'::regclass);
+
+
+--
+-- Name: segreteria id; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.segreteria ALTER COLUMN id SET DEFAULT nextval('public.segreteria_id_seq'::regclass);
+
+
+--
+-- Name: studente matricola; Type: DEFAULT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.studente ALTER COLUMN matricola SET DEFAULT nextval('public.studente_matricola_seq'::regclass);
+
+
+--
+-- Data for Name: carriera; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.carriera (data, insegnamento, corso_di_laurea, studente, voto) FROM stdin;
+\.
+
+
+--
+-- Data for Name: corso_di_laurea; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.corso_di_laurea (id, responsabile, tipologia, nome) FROM stdin;
+1	1	triennale	Ingegneria meccanica
+2	2	triennale	Informatica
+3	3	magistrale	Informatica
+4	4	triennale	Architettura
+5	5	magistrale	Ingegneria Biomedica
+6	6	triennale	Scienze politiche
+7	7	magistrale	Ingeneria meccanica
+8	8	triennale	Giurisprudenza
+9	9	magistrale	Psicologia clinica
+\.
+
+
+--
+-- Data for Name: docente; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.docente (id, utente, nome, cognome, e_mail) FROM stdin;
+1	docente1	Francesco	Bianchi	francesco.bianchi@example.com
+2	docente2	Chiara	Rossi	chiara.rossi@example.com
+3	docente3	Luca	Ferrari	luca.ferrari@example.com
+4	docente4	Alessia	Ricci	alessia.ricci@example.com
+5	docente5	Marco	Martini	marco.martini@example.com
+6	docente6	Elena	Conti	elena.conti@example.com
+7	docente7	Davide	Galli	davide.galli@example.com
+8	docente8	Valentina	Lombardi	valentina.lombardi@example.com
+9	docente9	Federico	Mancini	federico.mancini@example.com
+10	docente10	Simone	Romano	simone.romano@example.com
+11	docente11	Giulia	Marini	giulia.marini@example.com
+12	docente12	Lorenzo	Rizzo	lorenzo.rizzo@example.com
+13	docente13	Martina	Costa	martina.costa@example.com
+14	docente14	Andrea	Galli	andrea.galli@example.com
+15	docente15	Elisa	Bianchi	elisa.bianchi@example.com
+16	docente16	Giovanni	Ricci	giovanni.ricci@example.com
+17	docente17	Francesca	Ferrari	francesca.ferrari@example.com
+18	docente18	Matteo	Martini	matteo.martini@example.com
+19	docente19	Sara	Conti	sara.conti@example.com
+20	docente20	Paolo	Galli	paolo.galli@example.com
+\.
+
+
+--
+-- Data for Name: esame; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.esame (corso_di_laurea, insegnamento, data) FROM stdin;
+\.
+
+
+--
+-- Data for Name: insegnamento; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.insegnamento (codice_univoco, corso_di_laurea, responsabile, nome, descrizione, anno) FROM stdin;
+1	1	1	Meccanica delle Strutture	Studio delle strutture meccaniche	1
+2	1	2	Termodinamica Applicata	Studio delle leggi termodinamiche	1
+3	1	3	Progettazione di Macchine	Progettazione di sistemi meccanici	2
+4	2	4	Programmazione Java	Studio del linguaggio Java	1
+5	2	5	Algoritmi e Strutture Dati	Studio degli algoritmi e delle strutture dati	1
+6	2	6	Basi di Dati	Introduzione alle basi di dati	2
+7	4	7	Architettura del Rinascimento	Studio dell'architettura rinascimentale	1
+8	4	8	Progettazione degli Spazi Urbani	Pianificazione degli spazi urbani	2
+9	4	9	Restauro e Conservazione	Tecniche di restauro architettonico	3
+10	5	10	Biomeccanica	Studio delle applicazioni biomeccaniche	1
+11	5	11	Strumentazione Biomedica	Studio degli strumenti biomedici	1
+12	5	12	Imaging Medico	Introduzione all'imaging medico	2
+13	6	13	Teoria Politica	Studio delle teorie politiche	1
+14	6	14	Sistemi Politici Comparati	Analisi dei sistemi politici internazionali	2
+15	6	15	Politiche Pubbliche	Analisi delle politiche pubbliche	3
+16	7	16	Dinamica Strutturale	Studio della dinamica delle strutture	1
+17	7	17	Tecnologie Avanzate dei Materiali	Studio dei materiali avanzati	1
+18	9	18	Psicopatologia	Studio delle malattie mentali	1
+19	9	19	Psicoterapia	Studio delle tecniche psicoterapeutiche	1
+20	9	19	Psicoterapia Cognitivo-Comportamentale	Studio dell'approccio terapeutico cognitivo-comportamentale	2
+21	9	20	Psicodiagnostica	Studio delle metodologie diagnostiche in psicologia	2
+22	3	6	Intelligenza Artificiale	Studio dell'intelligenza artificiale	1
+23	3	5	Sistemi Distribuiti	Studio dei sistemi distribuiti	1
+24	7	17	Robotica Industriale	Studio della robotica industriale	1
+25	7	16	Simulazione e Modellistica	Studio della simulazione e modellistica	2
+26	8	14	Diritto Penale	Studio del diritto penale	1
+27	8	13	Diritto Civile	Studio del diritto civile	1
+28	2	6	Basi di Dati Avanzate	Approfondimento sulle basi di dati	3
+29	2	4	Sicurezza Informatica	Studio della sicurezza informatica	2
+30	5	12	Dispositivi Medici Avanzati	Studio dei dispositivi medici avanzati	2
+31	2	5	Reti di Calcolatori	Studio delle reti di calcolatori	2
+32	6	15	Economia Politica	Studio dell'economia politica	2
+33	5	11	Biologia Molecolare Applicata	Studio delle applicazioni della biologia molecolare	2
+34	1	1	Dinamica dei Fluidi	Studio dei fluidi in movimento	2
+35	9	20	Psicoterapia Psicoanalitica	Studio dell'approccio psicoanalitico alla psicoterapia	2
+36	3	3	Reti Neurali	Studio delle reti neurali artificiali	2
+37	7	16	Simulazione di Processi Industriali	Studio della simulazione di processi industriali	2
+38	8	14	Diritto del Lavoro	Studio del diritto del lavoro	2
+39	9	18	Psicologia delle Relazioni	Studio delle dinamiche relazionali	2
+\.
+
+
+--
+-- Data for Name: iscrizione_esami; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.iscrizione_esami (data, insegnamento, corso_di_laurea, studente) FROM stdin;
+\.
+
+
+--
+-- Data for Name: propedeuticita; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.propedeuticita (corso_di_laurea1, insegnamento, corso_di_laurea2, propedeutico_a) FROM stdin;
+1	1	1	3
+2	6	2	28
+3	22	3	36
+4	7	4	9
+5	11	5	30
+7	24	7	25
+9	18	9	21
+9	18	9	20
+9	19	9	35
+\.
+
+
+--
+-- Data for Name: segreteria; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.segreteria (id, utente, nome, cognome) FROM stdin;
+1	segreteria1	Luca	Rossi
+2	segreteria2	Alessia	Bianchi
+3	segreteria3	Marco	Ricci
+4	segreteria4	Elena	Martini
+5	segreteria5	Davide	Conti
+6	segreteria6	Valentina	Ferrari
+7	segreteria7	Federico	Rizzo
+8	segreteria8	Chiara	Galli
+9	segreteria9	Simone	Lombardi
+10	segreteria10	Giulia	Costa
+11	segreteria11	Lorenzo	Mancini
+12	segreteria12	Martina	Romano
+13	segreteria13	Andrea	Marini
+\.
+
+
+--
+-- Data for Name: storico_carriera; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.storico_carriera (data, insegnamento, corso_di_laurea, studente, voto, esito) FROM stdin;
+\.
+
+
+--
+-- Data for Name: storico_studente; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.storico_studente (matricola, corso_di_laurea, nome, cognome, e_mail) FROM stdin;
+\.
+
+
+--
+-- Data for Name: studente; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.studente (matricola, corso_di_laurea, utente, nome, cognome, e_mail) FROM stdin;
+1	1	studente1	Lorenzo	Bianchi	lorenzo.bianchi@example.com
+2	2	studente2	Sofia	Rossi	sofia.rossi@example.com
+3	3	studente3	Matteo	Ferrari	matteo.ferrari@example.com
+4	4	studente4	Alessia	Martini	alessia.martini@example.com
+5	5	studente5	Gabriele	Conti	gabriele.conti@example.com
+6	6	studente6	Chiara	Galli	chiara.galli@example.com
+7	7	studente7	Andrea	Rizzo	andrea.rizzo@example.com
+8	8	studente8	Francesca	Lombardi	francesca.lombardi@example.com
+9	9	studente9	Luca	Mancini	luca.mancini@example.com
+10	1	studente10	Elena	Romano	elena.romano@example.com
+11	1	studente11	Davide	Marini	davide.marini@example.com
+12	1	studente12	Alessandro	Russo	alessandro.russo@example.com
+13	2	studente13	Martina	Galli	martina.galli@example.com
+14	3	studente14	Davide	Ferrari	davide.ferrari@example.com
+15	4	studente15	Valentina	Romano	valentina.romano@example.com
+16	5	studente16	Federica	Marini	federica.marini@example.com
+17	6	studente17	Paolo	Rizzo	paolo.rizzo@example.com
+18	7	studente18	Elisabetta	Costa	elisabetta.costa@example.com
+19	8	studente19	Giacomo	Galli	giacomo.galli@example.com
+20	9	studente20	Lorenzo	Ricci	lorenzo.ricci@example.com
+21	2	studente21	Martina	Ricci	martina.ricci@example.com
+22	3	studente22	Giovanni	Ferrari	giovanni.ferrari@example.com
+23	4	studente23	Francesca	Bianchi	francesca.bianchi@example.com
+24	5	studente24	Matteo	Rossi	matteo.rossi@example.com
+25	6	studente25	Sara	Martini	sara.martini@example.com
+26	7	studente26	Lorenzo	Conti	lorenzo.conti@example.com
+27	8	studente27	Elisa	Galli	elisa.galli@example.com
+28	9	studente28	Marco	Rizzo	marco.rizzo@example.com
+29	1	studente29	Alessio	Lombardi	alessio.lombardi@example.com
+30	1	studente30	Valentina	Mancini	valentina.mancini@example.com
+31	2	studente31	Ludovica	Romano	ludovica.romano@example.com
+32	3	studente32	Daniele	Marini	daniele.marini@example.com
+33	4	studente33	Giulia	Ferrari	giulia.ferrari@example.com
+34	5	studente34	Andrea	Bianchi	andrea.bianchi@example.com
+35	6	studente35	Elena	Rossi	elena.rossi@example.com
+36	7	studente36	Luca	Martini	luca.martini@example.com
+37	8	studente37	Chiara	Conti	chiara.conti@example.com
+38	9	studente38	Davide	Galli	davide.galli@example.com
+39	1	studente39	Valentina	Rizzo	valentina.rizzo@example.com
+40	1	studente40	Federico	Lombardi	federico.lombardi@example.com
+41	2	studente41	Simona	Mancini	simona.mancini@example.com
+42	3	studente42	Giovanni	Romano	giovanni.romano@example.com
+43	4	studente43	Francesca	Marini	francesca.marini@example.com
+44	5	studente44	Matteo	Ferrari	matteo.ferrari2@example.com
+45	6	studente45	Sara	Bianchi	sara.bianchi@example.com
+46	7	studente46	Lorenzo	Rossi	lorenzo.rossi@example.com
+47	8	studente47	Elisa	Martini	elisa.martini@example.com
+48	9	studente48	Marco	Conti	marco.conti@example.com
+49	1	studente49	Alessio	Galli	alessio.galli@example.com
+50	1	studente50	Valentina	Rizzo	valentina.rizzo2@example.com
+\.
+
+
+--
+-- Data for Name: utente; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.utente (username, password, tipo_utente) FROM stdin;
+segreteria1	67585038e06bfda21c80b2e1436b03ba	segreteria
+segreteria2	3645a8abc4d23808538a8adab64b1e69	segreteria
+segreteria3	aa34765b856598693c922657ae722e96	segreteria
+segreteria4	f60d4997e1f8dd33e4d84d32633dc51a	segreteria
+segreteria5	f9cee2a2fe5ccf492729f7ce04e1c50f	segreteria
+segreteria6	98f987ae10bd7d4d386699dbed85525e	segreteria
+segreteria7	b5b49cc59b33f789d9eae34100cd642b	segreteria
+segreteria8	74d3b2c246e1a9dc938fdd6eca9b3655	segreteria
+segreteria9	47d9ef273dff35a93e70ada8cdc2a3d7	segreteria
+segreteria10	1efcf9ab2f447c3b675dc189abfb1c7e	segreteria
+segreteria11	52fb9cd5c748208a2b070ced3a168927	segreteria
+segreteria12	1022deaadff02b5448f192d3176a4d85	segreteria
+segreteria13	d3418e7e170a243d1f18dc8223a8309a	segreteria
+studente1	1ed1789020e1d8015ba5e5f0fc61e933	studente
+studente2	c91ef9377233978d6a30efb51096a70d	studente
+studente3	6bfc9ea1966f679e1225eab79a706d51	studente
+studente4	470ecbe7777cc2f2e41bb67e401c70f0	studente
+studente5	6ab2b8b77be5515162c539c003ab72d3	studente
+studente6	8b4c2da14b992f569f8ed489524941e5	studente
+studente7	6f6b41c238b483b4c7a06849d03144f1	studente
+studente8	9b2cd8653fc5e1f22e285269603db267	studente
+studente9	2aeda738594052030779b11b2780a48a	studente
+studente10	6f3d4c6d64d3a53c5af9e53461d1b244	studente
+studente11	c6498f30a6c4437fb31b144a48b1cf4e	studente
+studente12	244e62d6050b4f657fb20f7e1c6fb02e	studente
+studente13	721b8b0377862c8808d8004a8fa4f2a4	studente
+studente14	fa41160ff7c1486d38ceaffe65a6bd8b	studente
+studente15	97277c458cb8213246e2e2d17cef1b1e	studente
+studente16	7817f04ff9c3daef02e9285a588516a3	studente
+studente17	6c760ab5cdcca290103120c64f5055f7	studente
+studente18	aab20445ea80d3f05d49819b9eb06d21	studente
+studente19	c1b1fb2d0d134d81ee1127228dfe77d2	studente
+studente20	8f766de9fa50a2324dd16529cb7d102c	studente
+studente21	e00687c279e329cb4c8973c266f9f7d0	studente
+studente22	af7ce4795d5a6d7b55e57387e54064dc	studente
+studente23	62c404b02c8d81d4cc66ab3392fb682e	studente
+studente24	78bbfa78f5b3f75b40e8c48fca5ae850	studente
+studente25	81775a5ae7c83b5195641234920d5759	studente
+studente26	4e4642308baeaef2dea5705001bc69de	studente
+studente27	c370acba7c44f02115f03b8e85885c76	studente
+studente28	2f83b78b037adf0142b6f65f5810de67	studente
+studente29	32c1d3f51784e7ada3d2f2df4bf990b0	studente
+studente30	708a3603e2159ff9a8005c4d8614ffd7	studente
+studente31	3209bb2af493d99e0f0a1fe20ab2fcdc	studente
+studente32	6f1646690726202ec5301e6bef035eaa	studente
+studente33	28d82b53b5d8e057b95787518333604c	studente
+studente34	969072918fca7931235510de5926b69a	studente
+studente35	ea5a18a1e35d559218c52393592e6d01	studente
+studente36	ef6b3af67d7ee59b28d1a513b58d182d	studente
+studente37	31d1d207a4d5b915ee6d21e99add9909	studente
+studente38	7b5c31c5ea8ab80c52f9d2df87778b00	studente
+studente39	6860f4df4553eb8ba71528123bb715c0	studente
+studente40	42e44e0a2f7be0c5cd7821c0cd2318d8	studente
+studente41	c7abae40ff11a8a9559c5901776794f8	studente
+studente42	377984580e49955548d6ddea02ddb342	studente
+studente43	c72556a52cac109d75212f417a2dae1d	studente
+studente44	8dbbc11666402f9b62abc385fc4c2be6	studente
+studente45	844a277f58cda8111d2cde69d83d8549	studente
+studente46	fa9935e19a2baee699e4af517a12df83	studente
+studente47	b94e5b20b80bc3dcb48f573823225d06	studente
+studente48	8ac53783eacbddb2e6ea59e0318b08cb	studente
+studente49	250097d1662137c57855eb2dd670b951	studente
+studente50	bf023d484c2ca2e06b44e2e574ed6c23	studente
+docente1	83e4b1789306d3d1c99140df3827d600	docente
+docente2	271559ec25268bb9bb2ad7fd8b4cf71a	docente
+docente3	af75c71ac23e1156c0ef1ba6a9deeb03	docente
+docente4	b2341b7b98aa959222caedeca6162bc8	docente
+docente5	84299cc177f9bb24a98417f5b2f23eef	docente
+docente6	b1f936e714c08ee39fa70a6fdaaea343	docente
+docente7	107aebea70acce94ff8f0d8174e93dfa	docente
+docente8	a75a8a6db113a9fc7035b4a7da8c7b18	docente
+docente9	bf26b7f1ffd6049a6c8ab757d48ca0a0	docente
+docente10	dbc8967458a9e337ad4cacfe0d58b650	docente
+docente11	e009d9915d5d76f420d4abc2edf95fff	docente
+docente12	cf1a2a9c8dfb765c08a917d3247ba2bd	docente
+docente13	b40869c1611a9c5bfc2f7b9f7d0a455b	docente
+docente14	0cf97449fb4d71423c47f5a88a68d07e	docente
+docente15	cb3f46b531b7ee9c603be513027a093d	docente
+docente16	a1e81c56d5c6505b504edeb2da5e9045	docente
+docente17	ca6cc6b92f64a08851c671064a3e1c56	docente
+docente18	3eb01e876cbed0d220212b45dd7ad7e1	docente
+docente19	5aa904f6bcc64b80a97b94c5d3a4a117	docente
+docente20	1fcd4fca56c9265400614329e29b0158	docente
+\.
+
+
+--
+-- Name: corso_di_laurea_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.corso_di_laurea_id_seq', 9, true);
+
+
+--
+-- Name: docente_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.docente_id_seq', 20, true);
+
+
+--
+-- Name: insegnamento_codice_univoco_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.insegnamento_codice_univoco_seq', 39, true);
+
+
+--
+-- Name: segreteria_id_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.segreteria_id_seq', 13, true);
+
+
+--
+-- Name: studente_matricola_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
+--
+
+SELECT pg_catalog.setval('public.studente_matricola_seq', 50, true);
+
+
+--
+-- Name: carriera carriera_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.carriera
+    ADD CONSTRAINT carriera_pkey PRIMARY KEY (data, insegnamento, corso_di_laurea, studente);
+
+
+--
+-- Name: corso_di_laurea corso_di_laurea_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.corso_di_laurea
+    ADD CONSTRAINT corso_di_laurea_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: corso_di_laurea corso_di_laurea_tipologia_nome_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.corso_di_laurea
+    ADD CONSTRAINT corso_di_laurea_tipologia_nome_key UNIQUE (tipologia, nome);
+
+
+--
+-- Name: docente docente_e_mail_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.docente
+    ADD CONSTRAINT docente_e_mail_key UNIQUE (e_mail);
+
+
+--
+-- Name: docente docente_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.docente
+    ADD CONSTRAINT docente_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: docente docente_utente_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.docente
+    ADD CONSTRAINT docente_utente_key UNIQUE (utente);
+
+
+--
+-- Name: esame esame_corso_di_laurea_data_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.esame
+    ADD CONSTRAINT esame_corso_di_laurea_data_key UNIQUE (corso_di_laurea, data);
+
+
+--
+-- Name: esame esame_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.esame
+    ADD CONSTRAINT esame_pkey PRIMARY KEY (corso_di_laurea, insegnamento, data);
+
+
+--
+-- Name: insegnamento insegnamento_corso_di_laurea_nome_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.insegnamento
+    ADD CONSTRAINT insegnamento_corso_di_laurea_nome_key UNIQUE (corso_di_laurea, nome);
+
+
+--
+-- Name: insegnamento insegnamento_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.insegnamento
+    ADD CONSTRAINT insegnamento_pkey PRIMARY KEY (codice_univoco, corso_di_laurea);
+
+
+--
+-- Name: iscrizione_esami iscrizione_esami_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.iscrizione_esami
+    ADD CONSTRAINT iscrizione_esami_pkey PRIMARY KEY (data, insegnamento, corso_di_laurea, studente);
+
+
+--
+-- Name: propedeuticita propedeuticita_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.propedeuticita
+    ADD CONSTRAINT propedeuticita_pkey PRIMARY KEY (corso_di_laurea1, insegnamento, propedeutico_a);
+
+
+--
+-- Name: segreteria segreteria_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.segreteria
+    ADD CONSTRAINT segreteria_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: segreteria segreteria_utente_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.segreteria
+    ADD CONSTRAINT segreteria_utente_key UNIQUE (utente);
+
+
+--
+-- Name: storico_carriera storico_carriera_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.storico_carriera
+    ADD CONSTRAINT storico_carriera_pkey PRIMARY KEY (data, insegnamento, corso_di_laurea, studente);
+
+
+--
+-- Name: storico_studente storico_studente_e_mail_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.storico_studente
+    ADD CONSTRAINT storico_studente_e_mail_key UNIQUE (e_mail);
+
+
+--
+-- Name: storico_studente storico_studente_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.storico_studente
+    ADD CONSTRAINT storico_studente_pkey PRIMARY KEY (matricola);
+
+
+--
+-- Name: studente studente_e_mail_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.studente
+    ADD CONSTRAINT studente_e_mail_key UNIQUE (e_mail);
+
+
+--
+-- Name: studente studente_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.studente
+    ADD CONSTRAINT studente_pkey PRIMARY KEY (matricola);
+
+
+--
+-- Name: studente studente_utente_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.studente
+    ADD CONSTRAINT studente_utente_key UNIQUE (utente);
+
+
+--
+-- Name: utente utente_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.utente
+    ADD CONSTRAINT utente_pkey PRIMARY KEY (username);
+
+
+--
+-- Name: esame blocca_inserimento_data; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER blocca_inserimento_data BEFORE INSERT OR UPDATE ON public.esame FOR EACH ROW EXECUTE FUNCTION public.controlla_data();
+
+
+--
+-- Name: iscrizione_esami controlla_validita_iscrizione_trigger; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER controlla_validita_iscrizione_trigger BEFORE INSERT ON public.iscrizione_esami FOR EACH ROW EXECUTE FUNCTION public.controlla_validita_iscrizione();
+
+
+--
+-- Name: utente cripta_password_trigger; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER cripta_password_trigger BEFORE INSERT OR UPDATE ON public.utente FOR EACH ROW EXECUTE FUNCTION public.cripta_password();
+
+
+--
+-- Name: carriera inserimento_storico_carriera_trigger; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER inserimento_storico_carriera_trigger AFTER DELETE ON public.carriera FOR EACH ROW EXECUTE FUNCTION public.inserimento_storico_carriera();
+
+
+--
+-- Name: studente previeni_duplicati_studente; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER previeni_duplicati_studente BEFORE INSERT OR UPDATE ON public.studente FOR EACH ROW EXECUTE FUNCTION public.controlla_duplicati_studente();
+
+
+--
+-- Name: insegnamento trigger_controlla_validita_anno; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER trigger_controlla_validita_anno BEFORE INSERT OR UPDATE ON public.insegnamento FOR EACH ROW EXECUTE FUNCTION public.controlla_validita_anno();
+
+
+--
+-- Name: propedeuticita trigger_controllo_coerenza_propedeuticita; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER trigger_controllo_coerenza_propedeuticita BEFORE INSERT OR UPDATE ON public.propedeuticita FOR EACH ROW EXECUTE FUNCTION public.controllo_coerenza_propedeuticita();
+
+
+--
+-- Name: insegnamento trigger_controllo_numero_responsabile_insegnamenti; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER trigger_controllo_numero_responsabile_insegnamenti BEFORE INSERT OR UPDATE ON public.insegnamento FOR EACH ROW EXECUTE FUNCTION public.controllo_numero_responsabile_insegnamenti();
+
+
+--
+-- Name: corso_di_laurea trigger_controllo_responsabilita_corso_di_laurea; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER trigger_controllo_responsabilita_corso_di_laurea BEFORE INSERT OR UPDATE ON public.corso_di_laurea FOR EACH ROW EXECUTE FUNCTION public.controllo_responsabilita_corso_di_laurea();
+
+
+--
+-- Name: studente trigger_inserimento_storico_studente; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER trigger_inserimento_storico_studente BEFORE DELETE ON public.studente FOR EACH ROW EXECUTE FUNCTION public.inserimento_storico_studente();
+
+
+--
+-- Name: esame trigger_verifica_data_esami_univoca; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER trigger_verifica_data_esami_univoca BEFORE INSERT OR UPDATE ON public.esame FOR EACH ROW EXECUTE FUNCTION public.verifica_data_esami_univoca();
+
+
+--
+-- Name: carriera verifica_iscrizione_trigger; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER verifica_iscrizione_trigger BEFORE INSERT ON public.carriera FOR EACH ROW EXECUTE FUNCTION public.verifica_iscrizione_esami();
+
+
+--
+-- Name: carriera carriera_data_insegnamento_corso_di_laurea_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.carriera
+    ADD CONSTRAINT carriera_data_insegnamento_corso_di_laurea_fkey FOREIGN KEY (data, insegnamento, corso_di_laurea) REFERENCES public.esame(data, insegnamento, corso_di_laurea);
+
+
+--
+-- Name: carriera carriera_studente_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.carriera
+    ADD CONSTRAINT carriera_studente_fkey FOREIGN KEY (studente) REFERENCES public.studente(matricola) ON DELETE CASCADE;
+
+
+--
+-- Name: corso_di_laurea corso_di_laurea_responsabile_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.corso_di_laurea
+    ADD CONSTRAINT corso_di_laurea_responsabile_fkey FOREIGN KEY (responsabile) REFERENCES public.docente(id);
+
+
+--
+-- Name: docente docente_utente_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.docente
+    ADD CONSTRAINT docente_utente_fkey FOREIGN KEY (utente) REFERENCES public.utente(username) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: esame esame_corso_di_laurea_insegnamento_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.esame
+    ADD CONSTRAINT esame_corso_di_laurea_insegnamento_fkey FOREIGN KEY (corso_di_laurea, insegnamento) REFERENCES public.insegnamento(corso_di_laurea, codice_univoco);
+
+
+--
+-- Name: insegnamento insegnamento_corso_di_laurea_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.insegnamento
+    ADD CONSTRAINT insegnamento_corso_di_laurea_fkey FOREIGN KEY (corso_di_laurea) REFERENCES public.corso_di_laurea(id);
+
+
+--
+-- Name: insegnamento insegnamento_responsabile_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.insegnamento
+    ADD CONSTRAINT insegnamento_responsabile_fkey FOREIGN KEY (responsabile) REFERENCES public.docente(id);
+
+
+--
+-- Name: iscrizione_esami iscrizione_esami_data_insegnamento_corso_di_laurea_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.iscrizione_esami
+    ADD CONSTRAINT iscrizione_esami_data_insegnamento_corso_di_laurea_fkey FOREIGN KEY (data, insegnamento, corso_di_laurea) REFERENCES public.esame(data, insegnamento, corso_di_laurea) ON DELETE CASCADE;
+
+
+--
+-- Name: iscrizione_esami iscrizione_esami_studente_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.iscrizione_esami
+    ADD CONSTRAINT iscrizione_esami_studente_fkey FOREIGN KEY (studente) REFERENCES public.studente(matricola) ON DELETE CASCADE;
+
+
+--
+-- Name: propedeuticita propedeuticita_corso_di_laurea1_insegnamento_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.propedeuticita
+    ADD CONSTRAINT propedeuticita_corso_di_laurea1_insegnamento_fkey FOREIGN KEY (corso_di_laurea1, insegnamento) REFERENCES public.insegnamento(corso_di_laurea, codice_univoco);
+
+
+--
+-- Name: propedeuticita propedeuticita_corso_di_laurea2_propedeutico_a_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.propedeuticita
+    ADD CONSTRAINT propedeuticita_corso_di_laurea2_propedeutico_a_fkey FOREIGN KEY (corso_di_laurea2, propedeutico_a) REFERENCES public.insegnamento(corso_di_laurea, codice_univoco);
+
+
+--
+-- Name: segreteria segreteria_utente_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.segreteria
+    ADD CONSTRAINT segreteria_utente_fkey FOREIGN KEY (utente) REFERENCES public.utente(username) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: storico_carriera storico_carriera_data_insegnamento_corso_di_laurea_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.storico_carriera
+    ADD CONSTRAINT storico_carriera_data_insegnamento_corso_di_laurea_fkey FOREIGN KEY (data, insegnamento, corso_di_laurea) REFERENCES public.esame(data, insegnamento, corso_di_laurea);
+
+
+--
+-- Name: storico_carriera storico_carriera_studente_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.storico_carriera
+    ADD CONSTRAINT storico_carriera_studente_fkey FOREIGN KEY (studente) REFERENCES public.storico_studente(matricola);
+
+
+--
+-- Name: storico_studente storico_studente_corso_di_laurea_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.storico_studente
+    ADD CONSTRAINT storico_studente_corso_di_laurea_fkey FOREIGN KEY (corso_di_laurea) REFERENCES public.corso_di_laurea(id) ON UPDATE CASCADE;
+
+
+--
+-- Name: studente studente_corso_di_laurea_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.studente
+    ADD CONSTRAINT studente_corso_di_laurea_fkey FOREIGN KEY (corso_di_laurea) REFERENCES public.corso_di_laurea(id) ON UPDATE CASCADE;
+
+
+--
+-- Name: studente studente_utente_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.studente
+    ADD CONSTRAINT studente_utente_fkey FOREIGN KEY (utente) REFERENCES public.utente(username) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
